@@ -1,0 +1,189 @@
+# Copyright 2023 Pulser Development Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Base class for the backend interface."""
+from __future__ import annotations
+
+import warnings
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from typing import ClassVar, Type, cast
+
+import pulser
+from pulser.backend._classproperty import classproperty
+from pulser.backend.config import EmulationConfig
+from pulser.backend.observable import Callback
+from pulser.backend.results import Results
+from pulser.backend.state import State
+from pulser.channels.dmm import DMM
+from pulser.devices import Device
+
+
+class Backend(ABC):
+    """The backend abstract base class."""
+
+    def __init__(
+        self, sequence: pulser.Sequence, mimic_qpu: bool = False
+    ) -> None:
+        """Starts a new backend instance."""
+        self.validate_sequence(sequence, mimic_qpu=mimic_qpu)
+        self._sequence = sequence
+        self._mimic_qpu = bool(mimic_qpu)
+
+    @abstractmethod
+    def run(self) -> Results | Sequence[Results]:
+        """Executes the sequence on the backend."""
+        pass
+
+    @staticmethod
+    def validate_sequence(
+        sequence: pulser.Sequence, mimic_qpu: bool = False
+    ) -> None:
+        """Validates a sequence prior to submission."""
+        if not isinstance(sequence, pulser.Sequence):
+            raise TypeError(
+                "'sequence' should be a `Sequence` instance"
+                f", not {type(sequence)}. Got {sequence!r}."
+            )
+        if not mimic_qpu:
+            return
+
+        if sequence.is_empty():
+            raise ValueError(
+                "'sequence' should not be empty, please add an instruction "
+                "to one of the declared channels: "
+                f"{list(sequence.declared_channels)}."
+            )
+
+        if not isinstance(device := sequence.device, Device):
+            raise TypeError(
+                "To be sent to a QPU, the device of the sequence must be an "
+                f"instance of 'Device', not {type(device)}. Got {device!r}."
+            )
+        reg = sequence.get_register(include_mappable=True)
+        if device.requires_layout and (layout := reg.layout) is None:
+            raise ValueError(
+                f"'{device.name}' requires the sequence's register to be"
+                " defined from a `RegisterLayout`."
+            )
+        if (
+            not device.accepts_new_layouts
+            and layout is not None
+            and layout not in device.pre_calibrated_layouts
+        ):
+            raise ValueError(
+                f"'{device.name}' does not accept new register layouts so "
+                "the register's layout must be one of the layouts available "
+                f"in '{device.name}.calibrated_register_layouts'."
+            )
+
+
+class EmulatorBackend(Backend):
+    """The emulator backend parent class."""
+
+    default_config: ClassVar[EmulationConfig]
+
+    def __init__(
+        self,
+        sequence: pulser.Sequence,
+        *,
+        config: EmulationConfig | None = None,
+        mimic_qpu: bool = False,
+    ) -> None:
+        """Initializes the backend."""
+        super().__init__(sequence, mimic_qpu=mimic_qpu)
+        self._config = self.validate_config(config or self.default_config)
+
+        noise_model = self._config.noise_model
+
+        if noise_model is not None:
+            dmm_channels = [
+                name
+                for name, ch in self._sequence.declared_channels.items()
+                if isinstance(ch, DMM)
+            ]
+
+            if (
+                dmm_channels
+                and "register" in noise_model.noise_types
+                and noise_model.detuning_map_spot_waist is None
+            ):
+                raise ValueError(
+                    "Combining register noise with a DMM requires "
+                    "`detuning_map_spot_waist` to be defined. If not "
+                    "defined, atom thermal motion can lead to non-physical "
+                    f"effects; sequence uses DMM channels {dmm_channels}."
+                )
+
+        if (
+            self._config.prefer_device_noise_model
+            and self._sequence.device.noise_model is not None
+            and self._sequence.device.noise_model.runs is not None
+            and self._sequence.device.noise_model.runs
+            != self._config.n_trajectories
+        ):
+            config = self._config
+            warnings.warn(
+                f"'{sequence.device.noise_model.runs=}' is being "
+                f"ignored; '{config.n_trajectories=}' will be used instead.",
+                stacklevel=2,
+            )
+
+    @classproperty
+    def config_type(cls) -> Type[EmulationConfig]:
+        """The config class to use with this backend."""
+        return type(cls.default_config)
+
+    @classmethod
+    def validate_config(cls, config: EmulationConfig) -> EmulationConfig:
+        """Validates a given configuration for this backend.
+
+        Args:
+            config: The configuration to validate.
+
+        Returns:
+            The full configuration that will be used by the backend if
+            the given configuration passes validation.
+        """
+        if not isinstance(config, EmulationConfig):
+            raise TypeError(
+                "'config' must be an instance of 'EmulationConfig', "
+                f"not {type(config)}. Got {config!r}."
+            )
+        # Use all the parameters in config and then fill the rest with the
+        # ones of default_config
+        # See the BackendConfig definition to see why this works
+        options = {
+            **cls.default_config._backend_options,
+            **config._backend_options,
+        }
+        # Cast the states and operators to the types preferred by this
+        # backend before the config is created, so that any check done in
+        # the config_type's __init__ already sees the cast objects
+        state_type = cls.config_type.state_type
+        operator_type = cls.config_type.operator_type
+        if isinstance(options.get("initial_state"), State):
+            options["initial_state"] = state_type.from_state(
+                options["initial_state"]
+            )
+        for key in ("observables", "callbacks"):
+            if key in options:
+                options[key] = tuple(
+                    (
+                        cast(Callback, cb)._try_cast_state_ops(
+                            state_type, operator_type
+                        )
+                    )
+                    for cb in options[key]
+                )
+        return cast(EmulationConfig, cls.config_type(**options))

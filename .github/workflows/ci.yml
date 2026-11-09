@@ -1,0 +1,111 @@
+name: build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - develop
+
+jobs:
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Pulser
+        uses: actions/checkout@v4
+      - name: Pulser + flake8 install
+        uses: ./.github/workflows/pulser-setup
+        with:
+          extra-packages: flake8
+      - name: Lint with flake8
+        run: flake8
+  black:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Pulser
+        uses: actions/checkout@v4
+      - name: Pulser + black install
+        uses: ./.github/workflows/pulser-setup
+        with:
+          extra-packages: black
+      - name: Check formatting with black
+        run: black --check --diff .
+  ruff:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Pulser
+        uses: actions/checkout@v4
+      - name: pulser + ruff install
+        uses: ./.github/workflows/pulser-setup
+        with:
+          extra-packages: ruff
+      - name: Check numpy v2 compatibility with ruff
+        run: ruff check
+  isort:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Pulser
+        uses: actions/checkout@v4
+      - name: Pulser + isort install
+        uses: ./.github/workflows/pulser-setup
+        with:
+          extra-packages: isort
+      - name: Check import sorting with isort
+        run: isort --check-only --diff .
+  typing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Pulser
+        uses: actions/checkout@v4
+      - name: Pulser + mypy install
+        uses: ./.github/workflows/pulser-setup
+        with:
+          extra-packages: '''mypy\|pytest'''
+      - name: Type check with mypy
+        run: mypy
+  test:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+        with-torch: ["with-torch", "no-torch"]
+        numpy: ["numpy-v1", "numpy-v2"]
+        fast-validation: ["with-fast-validation", "no-fast-validation"]
+        include:
+          - python-version: "3.12"
+            with-torch: "with-torch"
+            numpy: "numpy-v1"
+            fast-validation: "no-fast-validation"
+        exclude:
+          # Numpy v1 does not support Python 3.14
+          - python-version: "3.14"
+            numpy: "numpy-v1"
+          - numpy: "numpy-v1"
+            with-torch: "no-torch"
+          # Only test fast-validation on no-torch jobs to limit matrix size
+          - with-torch: "with-torch"
+            fast-validation: "with-fast-validation"
+    steps:
+      - name: Check out Pulser
+        uses: actions/checkout@v4
+      - name: Pulser + pytest install
+        uses: ./.github/workflows/pulser-setup
+        with:
+          python-version: ${{ matrix.python-version }}
+          extra-packages: pytest
+          with-torch: ${{ matrix.with-torch }}
+          numpy: ${{ matrix.numpy }}
+          with-fast-validation: ${{ matrix.fast-validation }}
+      - name: Run the unit tests & generate coverage report
+        if: ${{ matrix.with-torch == 'with-torch'}}
+        run: pytest --cov --cov-fail-under=100
+      - name: Run the unit tests without torch installed
+        if: ${{ matrix.with-torch != 'with-torch'}}
+        run: pytest --cov
+      - name: Test validation with legacy jsonschema
+        if: ${{ matrix.python-version != '3.14'}}
+        run: |
+          pip install jsonschema==4.17.3
+          pytest tests/test_abstract_repr.py -W ignore::DeprecationWarning

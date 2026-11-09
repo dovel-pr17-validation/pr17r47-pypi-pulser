@@ -1,0 +1,19 @@
+[flake8]
+docstring-convention = google
+exclude = ./build, ./docs, ./__venv__
+extend-ignore =
+    # D105 Missing docstring in magic method
+    D105,
+    # E203 whitespace before ':' (for compliance with black)
+    E203,
+per-file-ignores =
+  # D100 Missing docstring in public module
+  # D101 Missing docstring in public class
+  # D102 Missing docstring in public method
+  # D103 Missing docstring in public function
+  # F401 Module imported but unused
+  tests/*: D100, D101, D102, D103
+  __init__.py: F401
+  pulser-core/pulser/backends.py: F401
+  pulser-core/pulser/math/__init__.py: D103
+  setup.py: D100

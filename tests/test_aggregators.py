@@ -1,0 +1,201 @@
+import re
+from collections import Counter
+from unittest.mock import patch
+
+import numpy as np
+import pytest
+
+from pulser.backend.aggregators import (
+    _bag_union_aggregator,
+    _mean_aggregator,
+    _mean_std_aggregator,
+    _std_aggregator,
+)
+
+
+def test_bag_union():
+    counter1 = {"1010": 5, "0101": 7, "0000": 2}
+    counter2 = Counter({"1010": 3, "0101": 9, "1111": 4})
+
+    union = _bag_union_aggregator([counter1, counter2])
+    assert union == {"1010": 8, "0101": 16, "0000": 2, "1111": 4}
+
+
+@pytest.mark.parametrize(
+    "test_torch",
+    [True, False],
+)
+def test__mean_aggregator(test_torch: bool):
+    input = [1.0, 2.0, 3.0, 4.0]
+    assert _mean_aggregator(input) == 2.5
+
+    input2 = [1.0j, 2.0j, 3.0j, 4.0j]
+    assert _mean_aggregator(input2) == 2.5j
+
+    input3 = [
+        np.array([1.0, 2.0, 3.0]),
+        np.array([2.0, 3.0, 4.0]),
+        np.array([3.0, 4.0, 5.0]),
+    ]
+    assert np.all(_mean_aggregator(input3) == np.array([2.0, 3.0, 4.0]))
+
+    input4 = [[1.0, 2.0, 3.0], [2.0, 3.0, 4.0], [3.0, 4.0, 5.0]]
+    assert _mean_aggregator(input4) == [2.0, 3.0, 4.0]
+
+    input5 = [[[1.0, 2.0, 3.0]], [[2.0, 3.0, 4.0]], [[3.0, 4.0, 5.0]]]
+    assert _mean_aggregator(input5) == [[2.0, 3.0, 4.0]]
+    if test_torch:
+        torch = pytest.importorskip("torch")
+        input6 = [
+            torch.tensor([1.0, 2.0, 3.0]),
+            torch.tensor([2.0, 3.0, 4.0]),
+            torch.tensor([3.0, 4.0, 5.0]),
+        ]
+        assert torch.allclose(
+            _mean_aggregator(input6), torch.tensor([2.0, 3.0, 4.0])
+        )
+
+
+def test__mean_aggregator_errors():
+    with pytest.raises(ValueError, match="Cannot process 0 samples."):
+        _mean_aggregator([])
+
+    with pytest.raises(
+        ValueError, match="Cannot process list of empty lists."
+    ):
+        _mean_aggregator([[], []])
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "Need to supply a list of values to process, not <class 'str'>. "
+            "Got 'abcd'."
+        ),
+    ):
+        _mean_aggregator("abcd")
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "Mean aggregator cannot process data of type <class 'dict'>. "
+            "Got {}."
+        ),
+    ):
+        _mean_aggregator([{}, {}])
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "Cannot process list of lists of <class 'dict'>. Got {}."
+        ),
+    ):
+        _mean_aggregator([[{}], [{}]])
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "Cannot process list of matrices of <class 'str'>. Got 'abcd'."
+        ),
+    ):
+        _mean_aggregator([[["abcd"]], [["efgh"]]])
+
+    with pytest.raises(
+        ValueError, match="Cannot process list of matrices with empty columns."
+    ):
+        _mean_aggregator([[[]], [[]]])
+
+
+@pytest.mark.parametrize(
+    "test_torch",
+    [True, False],
+)
+def test__std_aggregator(test_torch: bool):
+    input = [1.0, 2.0, 3.0, 4.0]
+    assert np.isclose(_std_aggregator(input), 1.2909944487358056)
+
+    input2 = [1.0j, 2.0j, 3.0j, 4.0j]
+    assert np.isclose(_std_aggregator(input2), 1.2909944487358056)
+
+    input3 = [
+        np.array([1.0, 2.0, 3.0]),
+        np.array([2.0, 3.0, 4.0]),
+        np.array([3.0, 4.0, 5.0]),
+    ]
+    assert np.all(_std_aggregator(input3) == np.array([1.0, 1.0, 1.0]))
+
+    input4 = [[1.0, 2.0, 3.0], [2.0, 3.0, 4.0], [3.0, 4.0, 5.0]]
+    assert _std_aggregator(input4) == [1.0, 1.0, 1.0]
+
+    input5 = [[[1.0, 2.0, 3.0]], [[2.0, 3.0, 4.0]], [[3.0, 4.0, 5.0]]]
+    assert _std_aggregator(input5) == [[1.0, 1.0, 1.0]]
+    if test_torch:
+        torch = pytest.importorskip("torch")
+        input6 = [
+            torch.tensor([1.0, 2.0, 3.0]),
+            torch.tensor([2.0, 3.0, 4.0]),
+            torch.tensor([3.0, 4.0, 5.0]),
+        ]
+        assert torch.allclose(
+            _std_aggregator(input6), torch.tensor([1.0, 1.0, 1.0])
+        )
+
+
+def test__std_aggregator_errors():
+    with pytest.raises(ValueError, match="Cannot process 0 samples."):
+        _std_aggregator([])
+
+    with pytest.raises(
+        ValueError, match="Cannot process list of empty lists."
+    ):
+        _std_aggregator([[], []])
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "Need to supply a list of values to process, not <class 'str'>. "
+            "Got 'abcd'."
+        ),
+    ):
+        _std_aggregator("abcd")
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "Std aggregator cannot process data of type <class 'dict'>. "
+            "Got {}."
+        ),
+    ):
+        _std_aggregator([{}, {}])
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "Cannot process list of lists of <class 'dict'>. Got {}."
+        ),
+    ):
+        _std_aggregator([[{}], [{}]])
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "Cannot process list of matrices of <class 'str'>. Got 'abcd'."
+        ),
+    ):
+        _std_aggregator([[["abcd"]], [["efgh"]]])
+
+    with pytest.raises(
+        ValueError, match="Cannot process list of matrices with empty columns."
+    ):
+        _std_aggregator([[[]], [[]]])
+
+
+def test__mean_std_aggregator():
+    with patch("pulser.backend.aggregators._mean_aggregator") as mock_mean:
+        with patch("pulser.backend.aggregators._std_aggregator") as mock_std:
+            mock_mean.return_value = 5.5
+            mock_std.return_value = 6.5
+            input = [1000.0, 2000.0]
+            result = _mean_std_aggregator(input)
+            mock_mean.assert_called_once_with(input)
+            mock_std.assert_called_once_with(input)
+            assert result == (5.5, 6.5)

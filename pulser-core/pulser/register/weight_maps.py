@@ -1,0 +1,270 @@
+# Copyright 2023 Pulser Development Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Defines weight maps on top of traps."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import typing
+import warnings
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Mapping, Optional, TypeVar, cast
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.axes import Axes
+from numpy.typing import ArrayLike
+
+from pulser.json.utils import obj_to_dict
+from pulser.register._reg_drawer import RegDrawer
+from pulser.register.traps import COORD_PRECISION, Traps
+
+if TYPE_CHECKING:
+    from pulser.register.base_register import QubitId
+
+from scipy.spatial.distance import cdist
+
+import pulser.json.abstract_repr as pulser_abstract_repr
+import pulser.math as pm
+from pulser.json.abstract_repr.serializer import AbstractReprEncoder
+from pulser.json.abstract_repr.validation import validate_abstract_repr
+
+WEIGHT_PRECISION = 6
+
+WeightMapType = TypeVar("WeightMapType", bound="WeightMap")
+
+
+@dataclass(init=False, repr=False, eq=False, frozen=True)
+class WeightMap(Traps, RegDrawer):
+    """Defines a generic map of weights on traps.
+
+    Args:
+        trap_coordinates: An array containing the coordinates of the traps.
+        weights: A list of weights (between 0 and 1) to associate to the traps.
+    """
+
+    weights: tuple[float, ...]
+
+    def __init__(
+        self,
+        trap_coordinates: ArrayLike,
+        weights: typing.Sequence[float],
+        slug: str | None = None,
+    ) -> None:
+        """Initializes a new weight map."""
+        super().__init__(trap_coordinates, slug)
+        if len(cast(list, trap_coordinates)) != len(weights):
+            raise ValueError(
+                f"Number of traps ({len(cast(list, trap_coordinates))}) and "
+                f"weights ({len(weights)}) don't match."
+            )
+        weights_arr = np.array(weights)
+        in_range = (weights_arr >= -pm.VALIDATION_TOLERANCE) & (
+            weights_arr <= 1 + pm.VALIDATION_TOLERANCE
+        )
+        if not np.all(in_range):
+            out_of_range = weights_arr[~in_range].tolist()
+            raise ValueError(
+                "All weights must be between 0 and 1; found out-of-range "
+                f"weights {out_of_range} in {weights_arr.tolist()}."
+            )
+        if np.count_nonzero(weights) == 0:
+            warnings.warn(
+                "A WeightMap should have at least one non-zero weight.",
+                stacklevel=3,
+            )
+        # Clip the weights that are within tolerance of the limits
+        object.__setattr__(
+            self, "weights", tuple(np.clip(weights_arr, 0, 1).tolist())
+        )
+
+    @property
+    def trap_coordinates(self) -> np.ndarray:
+        """The array of trap coordinates, in the order they were given."""
+        return self._coords_arr.as_array(detach=True)
+
+    @property
+    def _rounded_weights(self) -> np.ndarray:
+        return np.round(self.weights, decimals=WEIGHT_PRECISION)
+
+    @property
+    def sorted_weights(self) -> np.ndarray:
+        """The weights sorted to match the sorted trap coordinates."""
+        sorting = self._calc_sorting_order()
+        return cast(np.ndarray, self._rounded_weights[sorting])
+
+    def get_qubit_weight_map(
+        self,
+        qubits: Mapping[QubitId, ArrayLike],
+        spot_waist: float | None = None,
+    ) -> dict[QubitId, float]:
+        """Creates a map between qubit IDs and the weight on their sites."""
+        coords_arr = self.sorted_coords
+        weights_arr = self.sorted_weights
+        q_pos_arr = (
+            pm.vstack(list(qubits.values()))
+            .astype(float)
+            .as_array(detach=True)
+        )
+        dists = cdist(q_pos_arr, coords_arr)
+
+        if spot_waist:
+            spots_shape = np.exp(-(dists**2) / (2 * spot_waist**2))
+        else:
+            # Allows for every point that's within COORD_PRECISION in x and y
+            spots_shape = dists < np.sqrt(2) * (10 ** (-COORD_PRECISION))
+
+        total_weights = spots_shape @ weights_arr
+        return dict(zip(qubits.keys(), total_weights))
+
+    def with_pos_offset(
+        self: WeightMapType, x_offset: float, y_offset: float
+    ) -> WeightMapType:
+        """Returns a new weight map with a common offset on all coordinates.
+
+        Args:
+            x_offset: The shift along x, in µm.
+            y_offset: The shift along y, in µm.
+
+        Returns:
+            A new instance of the weight map with the shift on all coordinates.
+        """
+        # Ensure new_coords are a copy of the array
+        new_coords = np.array(self.trap_coordinates)
+        # Done this way in case the coordinates are in 3D
+        new_coords[:, :2] += np.array([x_offset, y_offset])
+        return type(self)(
+            trap_coordinates=new_coords, weights=self.weights, slug=self.slug
+        )
+
+    def draw(
+        self,
+        labels: typing.Sequence[QubitId] | None = None,
+        fig_name: str | None = None,
+        kwargs_savefig: dict = {},
+        custom_ax: Optional[Axes] = None,
+        show: bool = True,
+    ) -> None:
+        """Draws the detuning map.
+
+        Args:
+            labels: If defined, writes the labels next to each site. Must have
+                the same length and order like the `trap_coordinates`.
+            fig_name: The name on which to save the figure.
+                If None the figure will not be saved.
+            kwargs_savefig: Keywords arguments for
+                ``matplotlib.pyplot.savefig``. Not applicable if `fig_name`
+                is ``None``.
+            custom_ax: If present, instead of creating its own Axes object,
+                the function will use the provided one. Warning: if fig_name
+                is set, it may save content beyond what is drawn in this
+                function.
+            show: Whether or not to call `plt.show()` before returning. When
+                combining this plot with other ones in a single figure, one may
+                need to set this flag to False.
+        """
+        pos = self.trap_coordinates
+        custom_ax = custom_ax or cast(Axes, self._initialize_fig_axes(pos)[1])
+
+        labels_ = (
+            labels if labels is not None else [str(i) for i in range(len(pos))]
+        )
+
+        super()._draw_2D(
+            custom_ax,
+            pos,
+            labels_,
+            with_labels=labels is not None,
+            are_traps=True,
+            dmm_qubits=dict(zip(labels_, self.weights)),
+        )
+
+        if fig_name is not None:
+            plt.savefig(fig_name, **kwargs_savefig)
+
+        if show:
+            plt.show()
+
+    @property
+    def _hash_object(self) -> hashlib._Hash:
+        hash_ = super()._hash_object
+        # Include the weights and the type in the hash
+        hash_.update(self.sorted_weights.tobytes())
+        hash_.update(type(self).__name__.encode())
+        return hash_
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}_{self._safe_hash().hex()}"
+
+    def _to_dict(self) -> dict[str, Any]:
+        return obj_to_dict(
+            self,
+            trap_coordinates=self.trap_coordinates,
+            weights=self.weights,
+            slug=self.slug,
+        )
+
+    def _to_abstract_repr(self) -> dict[str, Any]:
+        d: dict[str, Any] = dict(
+            traps=[
+                {"weight": weight, "x": x, "y": y}
+                for weight, (x, y) in zip(
+                    self.sorted_weights,
+                    self.sorted_coords,
+                )
+            ]
+        )
+        if self.slug is not None:
+            d["slug"] = self.slug
+        return d
+
+
+@dataclass(init=False, repr=False, eq=False, frozen=True)
+class DetuningMap(WeightMap):
+    """Defines a DetuningMap.
+
+    A ``DetuningMap`` is associated to a ``DMM`` in a ``Sequence``. It links a
+    set of weights to a set of trap coordinates. It is intended to be defined
+    by the user from a ``RegisterLayout``, a ``Register`` or a
+    ``MappableRegister`` using ``define_detuning_map``.
+
+    Args:
+        trap_coordinates: An array containing the coordinates of the traps.
+        weights: A list of detuning weights (between 0 and 1) to associate
+            to the traps.
+    """
+
+    def to_abstract_repr(self) -> str:
+        """Serialize the detuning map into an abstract JSON object."""
+        abstr_str = json.dumps(self, cls=AbstractReprEncoder)
+        validate_abstract_repr(abstr_str, "weight-map")
+        return abstr_str
+
+    @staticmethod
+    def from_abstract_repr(obj_str: str) -> DetuningMap:
+        """Deserialize a detuning map from an abstract JSON object.
+
+        Args:
+            obj_str: The JSON string representing the detuning map encoded in
+                the abstract JSON format.
+        """
+        if not isinstance(obj_str, str):
+            raise TypeError(
+                "The serialized detuning map must be given as a string. "
+                f"Instead, got object of type {type(obj_str)}."
+            )
+        return pulser_abstract_repr.deserializer.deserialize_detuning_map(
+            obj_str
+        )

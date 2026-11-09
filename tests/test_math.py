@@ -1,0 +1,503 @@
+# Copyright 2024 Pulser Development Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from __future__ import annotations
+
+import contextlib
+import json
+import sys
+
+import numpy as np
+import pytest
+
+import pulser
+import pulser.math as pm
+from pulser.json.abstract_repr.serializer import AbstractReprEncoder
+from pulser.json.coders import PulserDecoder, PulserEncoder
+
+
+def test_allclose_numpy():
+    a = pm.AbstractArray([1.0, np.nan])
+    b = np.array([1.0001, np.nan])
+
+    assert not pm.allclose(a, b, atol=1e-3)
+    assert pm.allclose(a, b, atol=1e-3, equal_nan=True)
+    assert not pm.allclose(a, b, atol=1e-5, rtol=0, equal_nan=True)
+
+
+def test_allclose_tensor():
+    torch = pytest.importorskip("torch")
+    a = pm.AbstractArray(torch.tensor([1.0, float("nan")], requires_grad=True))
+    b = torch.tensor([1.0001, float("nan")])
+
+    assert not pm.allclose(a, b, atol=1e-3)
+    assert pm.allclose(a, b, atol=1e-3, equal_nan=True)
+    assert not pm.allclose(a, b, atol=1e-5, rtol=0, equal_nan=True)
+    assert pm.allclose(
+        a, b.numpy().astype(np.float64), atol=1e-3, equal_nan=True
+    )
+    assert pm.allclose(
+        b.numpy().astype(np.float64), a, atol=1e-3, equal_nan=True
+    )
+
+
+def test_tensor_with_lazy_conj_or_neg_bit():
+    torch = pytest.importorskip("torch")
+    x = torch.tensor([1.0, 2.0, 0.5, -1.0], dtype=torch.float64)
+    z = torch.tensor([1 + 2j, 3 - 1j], dtype=torch.complex128)
+    # torch.fft.ifft of a real tensor and Tensor.conj() return conjugate views,
+    # and the imaginary part of a conjugate view is a negative view
+    cases = [
+        (pm.ifft(x), np.fft.ifft(x.numpy())),
+        (pm.AbstractArray(z.conj()), np.conj(z.numpy())),
+        (pm.AbstractArray(z.conj().imag), -z.numpy().imag),
+    ]
+    for arr, expected in cases:
+        assert arr.as_tensor().is_conj() or arr.as_tensor().is_neg()
+        np.testing.assert_allclose(arr.as_array(), expected)
+        np.testing.assert_allclose(arr.as_array(detach=True), expected)
+        np.testing.assert_allclose(np.asarray(arr), expected)
+
+
+@pytest.mark.parametrize(
+    "cast_to, requires_grad",
+    [(None, False), ("array", False), ("tensor", False), ("tensor", True)],
+)
+def test_pad(cast_to, requires_grad):
+    """Explicitly tested because it's the extensively rewritten."""
+    arr = [1.0, 2.0, 3.0]
+    if cast_to == "array":
+        arr = np.array(arr)
+    elif cast_to == "tensor":
+        torch = pytest.importorskip("torch")
+        arr = torch.tensor(arr, requires_grad=requires_grad)
+
+    def check_match(arr1: pm.AbstractArray, arr2):
+        assert arr1.requires_grad == requires_grad
+        np.testing.assert_array_equal(
+            arr1.as_array(detach=requires_grad), arr2
+        )
+
+    # "constant" mode
+
+    check_match(
+        pm.pad(arr, 2, mode="constant"), [0.0, 0.0, 1.0, 2.0, 3.0, 0.0, 0.0]
+    )
+    check_match(
+        pm.pad(arr, (2, 1), mode="constant"), [0.0, 0.0, 1.0, 2.0, 3.0, 0.0]
+    )
+    check_match(
+        pm.pad(arr, 1, mode="constant", constant_values=-1.0),
+        [-1.0, 1.0, 2.0, 3.0, -1.0],
+    )
+    check_match(
+        pm.pad(arr, (1, 2), mode="constant", constant_values=-1.0),
+        [-1.0, 1.0, 2.0, 3.0, -1.0, -1.0],
+    )
+    check_match(
+        pm.pad(arr, (1, 2), mode="constant", constant_values=(-1.0, 4.0)),
+        [-1.0, 1.0, 2.0, 3.0, 4.0, 4.0],
+    )
+
+    # "edge" mode
+
+    check_match(
+        pm.pad(arr, 2, mode="edge"), [1.0, 1.0, 1.0, 2.0, 3.0, 3.0, 3.0]
+    )
+    check_match(
+        pm.pad(arr, (2, 1), mode="edge"), [1.0, 1.0, 1.0, 2.0, 3.0, 3.0]
+    )
+    check_match(pm.pad(arr, (0, 2), mode="edge"), [1.0, 2.0, 3.0, 3.0, 3.0])
+
+
+@pytest.mark.parametrize("use_tensor", [False, True])
+def test_cdist(use_tensor):
+    positions_a = [[0.0, 0.0], [3.0, 4.0]]
+    positions_b = [[0.0, 4.0], [3.0, 0.0]]
+    if use_tensor:
+        torch = pytest.importorskip("torch")
+        positions_a = [
+            torch.tensor(position, requires_grad=True)
+            for position in positions_a
+        ]
+        positions_b = [
+            torch.tensor(position, requires_grad=True)
+            for position in positions_b
+        ]
+
+    positions = [
+        [pm.AbstractArray(position) for position in points]
+        for points in (positions_a, positions_b)
+    ]
+    distances = pm.cdist(*positions)
+
+    assert distances.is_tensor == use_tensor
+    np.testing.assert_allclose(
+        distances.as_array(detach=use_tensor), [[4.0, 3.0], [3.0, 4.0]]
+    )
+    if use_tensor:
+        distances.as_tensor().sum().backward()
+        gradients = [position.grad for position in positions_a + positions_b]
+        np.testing.assert_allclose(
+            [gradient.numpy() for gradient in gradients],
+            [[-1.0, -1.0], [1.0, 1.0], [-1.0, 1.0], [1.0, -1.0]],
+        )
+
+
+@pytest.mark.parametrize("tensor_first", [False, True])
+@pytest.mark.parametrize("other_backend", ["numpy", "torch"])
+@pytest.mark.parametrize("tensor_precision", [32, 64])
+def test_cdist_mixed_dtypes(tensor_first, other_backend, tensor_precision):
+    torch = pytest.importorskip("torch")
+    tensor_dtype = getattr(torch, f"float{tensor_precision}")
+    other_precision = 96 - tensor_precision
+    tensor_points = torch.tensor(
+        [[0.0, 0.0], [3.0, 4.0]],
+        dtype=tensor_dtype,
+        requires_grad=True,
+    )
+    other_points = np.array(
+        [[0.0, 4.0], [3.0, 0.0]], dtype=f"float{other_precision}"
+    )
+    if other_backend == "torch":
+        other_points = torch.tensor(other_points, requires_grad=True)
+    points = [tensor_points, other_points]
+    if not tensor_first:
+        points.reverse()
+
+    distances = pm.cdist(*points)
+
+    assert distances.as_tensor().dtype == torch.float64
+    np.testing.assert_allclose(
+        distances.as_array(detach=True), [[4.0, 3.0], [3.0, 4.0]]
+    )
+    distances.as_tensor().sum().backward()
+    assert tensor_points.grad.dtype == tensor_dtype
+    np.testing.assert_allclose(tensor_points.grad.numpy(), [[-1, -1], [1, 1]])
+    if other_backend == "torch":
+        np.testing.assert_allclose(
+            other_points.grad.numpy(), [[-1, 1], [1, -1]]
+        )
+
+
+class TestAbstractArray:
+
+    def test_transpose_numpy(self):
+        values = np.arange(24).reshape(2, 3, 4)
+        arr = pm.AbstractArray(values)
+
+        np.testing.assert_array_equal(arr.transpose(), values.swapaxes(0, 1))
+        np.testing.assert_array_equal(
+            arr.transpose(1, -1), values.swapaxes(1, -1)
+        )
+        assert arr.shape == values.shape
+
+    def test_transpose_tensor_preserves_gradients(self):
+        torch = pytest.importorskip("torch")
+        source = torch.arange(24.0, requires_grad=True)
+        values = source.reshape(2, 3, 4)
+        arr = pm.AbstractArray(values)
+
+        transposed = arr.transpose(1, 2)
+        assert transposed.is_tensor
+        assert transposed.requires_grad
+        torch.testing.assert_close(
+            transposed.as_tensor(), values.transpose(1, 2)
+        )
+        torch.testing.assert_close(
+            arr.transpose().as_tensor(), values.transpose(0, 1)
+        )
+        transposed.as_tensor().sum().backward()
+        torch.testing.assert_close(source.grad, torch.ones_like(source))
+
+    def test_non_castable_type(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "torch", None)
+        pm.AbstractArray.has_torch.cache_clear()
+        with pytest.raises(
+            ValueError,
+            match="The provided 'array' must be a torch tensor or "
+            "castable to an array of type float64. Got "
+            r"ConstantWaveform\(100 ns, 1\)",
+        ):
+            pm.AbstractArray(pulser.ConstantWaveform(100, 1), dtype=float)
+        # With dtype=None, works if the class can be stored in a numpy array
+        pm.AbstractArray(pulser.ConstantWaveform(100, 1))
+        with pytest.raises(
+            ValueError,
+            match="The provided 'array' must be a torch tensor or "
+            r"castable to an array. Got \[\[1.0\], \[2.0, 3.0\]\]",
+        ):
+            pm.AbstractArray([[1.0], [2.0, 3.0]])
+
+    @pytest.mark.parametrize("force_array", [False, True])
+    def test_no_torch(self, monkeypatch, force_array):
+        monkeypatch.setitem(sys.modules, "torch", None)
+        pm.AbstractArray.has_torch.cache_clear()
+
+        val = 3.2
+        arr = pm.AbstractArray(val, force_array=force_array, dtype=float)
+        assert not arr.is_tensor
+        with pytest.raises(RuntimeError, match="`torch` is not installed"):
+            arr.as_tensor()
+
+        assert arr.size == 1
+        assert arr.shape == ((1,) if force_array else ())
+        assert arr.ndim == int(force_array)
+        assert arr.real == 3.2
+        assert arr.dtype is np.dtype(float)
+        assert repr(arr) == repr(np.array(arr))
+        assert arr.detach() == arr
+
+    @pytest.mark.parametrize("force_array", [False, True])
+    @pytest.mark.parametrize("requires_grad", [False, True])
+    def test_with_torch(self, force_array, requires_grad):
+        pm.AbstractArray.has_torch.cache_clear()
+        torch = pytest.importorskip("torch")
+
+        t = torch.tensor(1.0, requires_grad=requires_grad)
+        arr = pm.AbstractArray(t, force_array=force_array)
+        assert arr.is_tensor
+        assert arr.as_tensor() == t
+        assert arr.as_array(detach=requires_grad) == t.detach().numpy()
+        assert arr.detach() == pm.AbstractArray(t.detach())
+        assert repr(arr) == repr(t[None] if force_array else t)
+
+    @pytest.mark.parametrize("requires_grad", [False, True])
+    def test_casting(self, requires_grad):
+        val = 4.1
+        if requires_grad:
+            torch = pytest.importorskip("torch")
+            val = torch.tensor(val, requires_grad=True)
+
+        arr = pm.AbstractArray(val)
+        assert int(arr) == int(val)
+        assert float(arr) == float(val)
+        assert bool(arr) == bool(val)
+
+    @pytest.mark.parametrize("scalar", [False, True])
+    @pytest.mark.parametrize("use_tensor", [False, True])
+    def test_unary_ops(self, use_tensor, scalar):
+        val = np.linspace(-1, 1)
+        if scalar:
+            val = val[13]
+        if use_tensor:
+            torch = pytest.importorskip("torch")
+            val = torch.tensor(val)
+            lib = torch
+        else:
+            lib = np
+
+        arr = pm.AbstractArray(val)
+        np.testing.assert_array_equal(-arr, -val)
+        np.testing.assert_array_equal(abs(arr), abs(val))
+        np.testing.assert_array_equal(round(arr), lib.round(val))
+        np.testing.assert_array_equal(
+            round(arr, 2), lib.round(val, decimals=2)
+        )
+
+    @pytest.mark.parametrize("scalar", [False, True])
+    @pytest.mark.parametrize("use_tensor", [False, True])
+    def test_comparison_ops(self, use_tensor, scalar):
+        min_, max_ = -1, 1
+        val = np.linspace(min_, max_, endpoint=True)
+        if scalar:
+            val = val[13]
+        if use_tensor:
+            torch = pytest.importorskip("torch")
+            val = torch.tensor(val, requires_grad=True)
+
+        arr = pm.AbstractArray(val)
+        assert np.all(arr < max_ + 1e-12)
+        assert np.all(arr <= max_)
+        assert np.all(arr > min_ - 1e-12)
+        assert np.all(arr >= min_)
+        assert np.all(arr == val)
+        assert np.all(arr != val * 5)
+
+    @pytest.mark.parametrize("scalar", [False, True])
+    @pytest.mark.parametrize("use_tensor", [False, True])
+    def test_binary_ops(self, use_tensor, scalar):
+        values = np.linspace(-1, 1, endpoint=True)
+        if scalar:
+            val = values[13]
+            assert val != 0
+        else:
+            val = values
+        val_np = val
+        if use_tensor:
+            torch = pytest.importorskip("torch")
+            val = torch.tensor(val)
+
+        arr = pm.AbstractArray(val)
+        # add
+        np.testing.assert_array_equal(arr + 5.0, val + 5.0)
+        np.testing.assert_array_equal(arr + values, val_np + values)
+        np.testing.assert_array_equal(2.0 + arr, val + 2.0)
+
+        # sub
+        np.testing.assert_array_equal(arr - 5.0, val - 5.0)
+        np.testing.assert_array_equal(arr - values, val_np - values)
+        np.testing.assert_array_equal(2.0 - arr, 2.0 - val)
+
+        # mul
+        np.testing.assert_array_equal(arr * 5.0, val * 5.0)
+        np.testing.assert_array_equal(arr * values, val_np * values)
+        np.testing.assert_array_equal(2.0 * arr, val * 2.0)
+
+        # truediv
+        np.testing.assert_array_equal(arr / 5.0, val / 5.0)
+        # Avoid zero division
+        np.testing.assert_array_equal(
+            arr / (values + 2.0), val_np / (values + 2.0)
+        )
+        np.testing.assert_array_equal(2.0 / arr, 2.0 / val)
+
+        # floordiv
+        np.testing.assert_array_equal(arr // 5.0, val // 5.0)
+        np.testing.assert_array_equal(
+            arr // (values + 2.0), val_np // (values + 2.0)
+        )
+        np.testing.assert_array_equal(2.0 // arr, 2.0 // val)
+
+        # pow
+        np.testing.assert_array_equal(arr**5.0, val**5.0)
+
+        # rounding errors here
+        np.testing.assert_array_almost_equal(
+            abs(arr) ** values, abs(val_np) ** values
+        )
+        np.testing.assert_array_almost_equal(2.0**arr, 2.0**val)
+
+        # mod
+        np.testing.assert_array_equal(arr % 5.0, val % 5.0)
+        np.testing.assert_array_equal(arr % values, val_np % values)
+        np.testing.assert_array_equal(2.0 % arr, 2.0 % val)
+
+        # matmul
+        if not scalar:
+            id_ = np.eye(len(arr)).tolist()
+            np.testing.assert_array_almost_equal(arr @ id_, val)
+            np.testing.assert_array_almost_equal(id_ @ arr, val)
+
+    @pytest.mark.parametrize(
+        "indices",
+        [
+            4,
+            slice(None, -1),
+            slice(2, 8),
+            slice(9, None),
+            [1, -5, 8],
+            np.array([1, 2, 4]),
+            np.random.random(10) > 0.5,
+        ],
+    )
+    @pytest.mark.parametrize(
+        "use_tensor, requires_grad",
+        [(False, False), (True, False), (True, True)],
+    )
+    def test_items(self, use_tensor, requires_grad, indices):
+        val = np.linspace(-1, 1, endpoint=True, num=10)
+        if use_tensor:
+            torch = pytest.importorskip("torch")
+            val = torch.tensor(val, requires_grad=requires_grad)
+
+        arr = pm.AbstractArray(val)
+
+        # getitem
+        assert np.all(arr[indices] == pm.AbstractArray(val[indices]))
+        assert arr[indices].is_tensor == use_tensor
+
+        # iter
+        for i, item in enumerate(arr):
+            assert item == val[i]
+            assert isinstance(item, pm.AbstractArray)
+            assert item.is_tensor == use_tensor
+            assert item.requires_grad == requires_grad
+
+        # setitem
+        if not requires_grad:
+            arr[indices] = np.ones(len(val))[indices]
+            val[indices] = 1.0
+            assert np.all(arr == val)
+            assert arr.is_tensor == use_tensor
+
+            arr[indices] = np.pi
+            val[indices] = np.pi
+            assert np.all(arr == val)
+            assert arr.is_tensor == use_tensor
+        else:
+            with pytest.raises(
+                RuntimeError,
+                match="Failed to modify a tensor that requires grad in place.",
+            ):
+                arr[indices] = np.ones(len(val))[indices]
+
+        if use_tensor:
+            # Check that a np.array is converted to tensor if assign a tensor
+            new_val = arr.as_array(detach=True)
+            arr_np = pm.AbstractArray(new_val)
+            assert not arr_np.is_tensor
+            arr_np[indices] = torch.zeros_like(
+                val, requires_grad=requires_grad
+            )[indices]
+            new_val[indices] = 0.0
+            assert np.all(arr_np == new_val)
+            assert arr_np.is_tensor
+            # The resulting tensor requires grad if the assigned one did
+            assert arr_np.requires_grad == requires_grad
+
+    @pytest.mark.parametrize("scalar", [False, True])
+    @pytest.mark.parametrize(
+        "use_tensor, requires_grad",
+        [(False, False), (True, False), (True, True)],
+    )
+    def test_serialization(self, scalar, use_tensor, requires_grad):
+        values = np.linspace(-1, 1, endpoint=True)
+        if scalar:
+            val = values[13]
+            assert val != 0
+        else:
+            val = values
+
+        if use_tensor:
+            torch = pytest.importorskip("torch")
+            val = torch.tensor(val, requires_grad=requires_grad)
+
+        arr = pm.AbstractArray(val)
+
+        context = (
+            pytest.raises(
+                NotImplementedError,
+                match="can't be serialized without losing the "
+                "computational graph",
+            )
+            if requires_grad
+            else contextlib.nullcontext()
+        )
+
+        with context:
+            assert json.dumps(arr, cls=AbstractReprEncoder) == str(
+                float(val) if scalar else val.tolist()
+            )
+
+        with context:
+            legacy_ser = json.dumps(arr, cls=PulserEncoder)
+            deserialized = json.loads(legacy_ser, cls=PulserDecoder)
+            assert isinstance(deserialized, pm.AbstractArray)
+            np.testing.assert_array_equal(deserialized, val)
+
+    def test_copy(self):
+        arr = pm.AbstractArray(np.array([1, 2, 5, 1, 4.0, 234]))
+        arr_copy = arr.__array__(copy=True)
+        assert np.all(arr == arr_copy)
+        assert arr is not arr_copy

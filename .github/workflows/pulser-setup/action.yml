@@ -1,0 +1,90 @@
+name: Pulser setup
+description: "Sets up Python and installs Pulser."
+inputs:
+  python-version:
+    description: Python version
+    required: false
+    default: "3.12"
+  extra-packages:
+    description: Extra packages to install (give to grep)
+    required: false
+    default: ""
+  with-torch:
+    description: Whether to include pytorch
+    required: false
+    default: "with-torch"
+  numpy:
+    description: Which version of numpy to install
+    required: false
+    default: "numpy-v2"
+  with-fast-validation:
+    description: Whether to include fastjsonschema
+    required: false
+    default: "no-fast-validation"
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: "pip"
+    - name: Upgrade ca-certificates
+      if: ${{ runner.os == 'Linux' }}
+      shell: bash
+      # apt doesn't rely on the TLS trust store: packages are checked against
+      # checksums in GPG-signed repository indexes.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --only-upgrade ca-certificates
+    - name: Remove compromised roots from /etc/ssl/cert.pem
+      if: ${{ runner.os == 'macOS' }}
+      shell: bash
+      # Built-in curl, git and openssl read this file without checking revocation,
+      # see https://emudhra.we-have-a-problem.com/ (macOS workaround).
+      run: |
+        sudo cp -p /etc/ssl/cert.pem /etc/ssl/cert.pem.bak &&
+        sudo awk '/^(###|===) /{skip=0}
+          /^=== .*\/CN=(AAA Certificate Services|emSign ECC Root CA - G3)$/{skip=1}
+          !skip' /etc/ssl/cert.pem.bak | sudo tee /etc/ssl/cert.pem > /dev/null
+    - name: Enforce pip constraints for the rest of the job
+      shell: bash
+      run: echo "PIP_CONSTRAINT=${{ github.workspace }}/.github/constraints.txt" >> "$GITHUB_ENV"
+    - name: Install Pulser (with torch)
+      if: ${{ inputs.with-torch == 'with-torch' }}
+      shell: bash
+      run: |
+        # Pinned pip >= 26.2.2 for the eMudhra/emSign CA incident, see https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576
+        python -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+        python -m pip install --upgrade pip certifi
+        make dev-install
+    - name: Install Pulser (without torch)
+      if: ${{ inputs.with-torch != 'with-torch' }} 
+      shell: bash
+      run: |
+        # Pinned pip >= 26.2.2 for the eMudhra/emSign CA incident, see https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576
+        python -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+        python -m pip install --upgrade pip certifi
+        make dev-install-no-torch
+    - name: Install numpy v1
+      if: ${{ inputs.numpy == 'numpy-v1'}}
+      shell: bash
+      run: |
+        pip install 'numpy==1.26.4' 'scipy<1.18'
+    - name: Install numpy v2
+      if: ${{ inputs.numpy == 'numpy-v2'}}
+      shell: bash
+      run: |
+        pip install numpy>=2
+    - name: Install fast-validation extra
+      if: ${{ inputs.with-fast-validation == 'with-fast-validation' }}
+      shell: bash
+      run: |
+        make dev-install-core-fast-validation
+    - name: Install extra packages from the dev requirements
+      if: "${{ inputs.extra-packages != '' }}"
+      shell: bash
+      run: |
+        grep -e ${{ inputs.extra-packages }} dev_requirements.txt \
+          | sed 's/ //g' \
+          | xargs pip install

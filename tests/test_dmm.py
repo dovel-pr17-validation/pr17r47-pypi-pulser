@@ -1,0 +1,535 @@
+# Copyright 2020 Pulser Development Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from __future__ import annotations
+
+import re
+from typing import Union, cast
+from unittest.mock import patch
+
+import numpy as np
+import pytest
+
+import pulser
+from pulser.channels.dmm import DMM
+from pulser.pulse import Pulse
+from pulser.register.base_register import BaseRegister
+from pulser.register.mappable_reg import MappableRegister
+from pulser.register.register_layout import RegisterLayout
+from pulser.register.special_layouts import TriangularLatticeLayout
+from pulser.register.weight_maps import (
+    WEIGHT_PRECISION,
+    DetuningMap,
+    WeightMap,
+)
+
+
+class TestDetuningMap:
+    @pytest.fixture
+    def layout(self) -> RegisterLayout:
+        return RegisterLayout([[0, 0], [1, 0], [0, 1], [1, 1]])
+
+    @pytest.fixture
+    def register(self, layout: RegisterLayout) -> BaseRegister:
+        return layout.define_register(
+            0, 1, 2, 3, qubit_ids=("0", "1", "2", "3")
+        )
+
+    @pytest.fixture
+    def map_reg(self, layout: RegisterLayout) -> MappableRegister:
+        return layout.make_mappable_register(4)
+
+    @pytest.fixture
+    def det_dict(self) -> dict[int, float]:
+        return {0: 1.0, 1: 0.3, 2: 0}
+
+    @pytest.fixture
+    def det_map(
+        self, layout: RegisterLayout, det_dict: dict[int, float]
+    ) -> DetuningMap:
+        return layout.define_detuning_map(det_dict)
+
+    @pytest.fixture
+    def slm_dict(self) -> dict[int, float]:
+        return {0: 1.0, 1: 1.0, 2: 1.0}
+
+    @pytest.fixture
+    def slm_map(
+        self, layout: RegisterLayout, slm_dict: dict[int, float]
+    ) -> DetuningMap:
+        return layout.define_detuning_map(slm_dict)
+
+    @pytest.mark.parametrize("bad_key", [{4: 1.0}, {"4": 1.0}])
+    def test_define_detuning_map(
+        self,
+        layout: RegisterLayout,
+        register: BaseRegister,
+        map_reg: MappableRegister,
+        bad_key: dict,
+    ):
+        for reg in (layout, map_reg):
+            with pytest.raises(
+                ValueError,
+                match=re.escape(
+                    "The trap ids of detuning weights have to be integers"
+                    " in [0, 3]; got invalid ids "
+                ),
+            ):
+                reg.define_detuning_map(bad_key)
+        with pytest.raises(
+            ValueError,
+            match=(
+                "The qubit ids linked to detuning weights have to be defined"
+                " in the register."
+            ),
+        ):
+            register.define_detuning_map(bad_key)
+
+    def test_qubit_weight_map(self, register):
+        # Purposefully unsorted
+        qid_weight_map = {"1": 1.0, "0": 0.1, "3": 0.4}
+        sorted_qids = sorted(qid_weight_map)
+        det_map = register.define_detuning_map(qid_weight_map)
+        qubits = register.qubits
+        coords = [qubits[qid] for qid in sorted_qids]
+        weights = [qid_weight_map[qid] for qid in sorted_qids]
+
+        np.testing.assert_equal(det_map.sorted_coords, coords)
+        np.testing.assert_equal(det_map.sorted_weights, weights)
+
+        # case: spot_waist is None
+        # We recover the original qid_weight_map (and undefined qids show as 0)
+        assert det_map.get_qubit_weight_map(qubits) == {
+            **qid_weight_map,
+            "2": 0.0,
+        }
+
+        # case: spot_waist is NOT None
+        spot_waist = 1.2
+        new_weights = {}
+        for qid, q_coord in qubits.items():
+            eff_weight = 0
+            for trap_coord, trap_weight in zip(coords, weights):
+                dists = np.linalg.norm(q_coord - trap_coord)
+                eff_weight += (
+                    np.exp(-(dists**2) / (2 * spot_waist**2)) * trap_weight
+                )
+            new_weights[qid] = eff_weight
+
+        # effect of the Gaussian trap profile
+        assert det_map.get_qubit_weight_map(
+            qubits, spot_waist
+        ) == pytest.approx(new_weights)
+
+        # Triangular layout
+        tri_layout = TriangularLatticeLayout(100, spacing=5)
+        sites = [31, 53, 39, 62, 43, 49, 42, 37, 48, 44, 55, 50]
+        labels = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
+        weights = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+        positions = np.array([tri_layout.traps_dict[i] for i in sites])
+        reg = pulser.Register.from_coordinates(
+            positions, labels=labels, center=True
+        )
+        det_map = reg.define_detuning_map(dict(zip(labels, weights)))
+        qubit_weight_map = det_map.get_qubit_weight_map(reg.qubits)
+        assert qubit_weight_map == dict(zip(labels, weights))
+
+    def test_hash(self, det_map, det_dict, layout):
+        disordered_det_dict = {
+            i: det_dict[i] for i in sorted(det_dict, reverse=True)
+        }
+        assert disordered_det_dict == det_dict
+        assert list(disordered_det_dict) != list(det_dict)
+
+        det_map2 = layout.define_detuning_map(disordered_det_dict)
+
+        # The maps differ in the arguments order
+        assert np.any(det_map.trap_coordinates != det_map2.trap_coordinates)
+        assert det_map.weights != det_map2.weights
+
+        # We can even introduce small deviations (below the WEIGHT_PRECISION)
+        # in the weights and they should stil be equal
+        det_map2 = DetuningMap(
+            trap_coordinates=det_map2.trap_coordinates,
+            weights=np.clip(
+                np.array(det_map2.weights) + 10 ** -(WEIGHT_PRECISION + 1),
+                0.0,
+                1.0,
+            ),
+        )
+
+        # They are equal in sorted and rounded content
+        np.testing.assert_equal(det_map.sorted_coords, det_map2.sorted_coords)
+        np.testing.assert_equal(
+            det_map.sorted_weights, det_map2.sorted_weights
+        )
+
+        # And they have the same type, so they should be equal
+        assert type(det_map) is type(det_map2)
+        assert det_map == det_map2
+
+        # This means their static hashes and reprs match
+        static_hash = det_map.static_hash()
+        assert static_hash == det_map2.static_hash()
+        assert repr(det_map) == repr(det_map2) == f"DetuningMap_{static_hash}"
+
+        # However, if the types don't match, this should no longer hold
+        w_map = WeightMap(det_map.trap_coordinates, det_map.weights)
+
+        # Content is still the same
+        np.testing.assert_equal(det_map.sorted_coords, w_map.sorted_coords)
+        np.testing.assert_equal(det_map.sorted_weights, w_map.sorted_weights)
+
+        # But the rest isn't
+        assert static_hash != w_map.static_hash()
+        assert repr(w_map) != repr(det_map)
+        assert repr(w_map) == f"WeightMap_{w_map.static_hash()}"
+        assert w_map != det_map
+
+    def test_detuning_map_bad_init(
+        self,
+        layout: RegisterLayout,
+        register: BaseRegister,
+        map_reg: MappableRegister,
+    ):
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "Number of traps (2) and weights (1) don't match."
+            ),
+        ):
+            DetuningMap([(0, 0), (1, 0)], [0])
+
+        # NaN is out of range but is caught by neither `< 0` nor `> 1`
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "All weights must be between 0 and 1; found out-of-range "
+                "weights [nan, -0.2] in [0.5, nan, -0.2]."
+            ),
+        ):
+            DetuningMap([(0, 0), (1, 0), (2, 0)], [0.5, float("nan"), -0.2])
+
+        # array-like weights are reported as plain numbers, not as the
+        # repr of each scalar (eg "np.float64(0.5)")
+        for array_weights in (
+            np.array([0.5, 1.5]),
+            np.array([0.5, 1.5], dtype=np.float32),
+        ):
+            with pytest.raises(
+                ValueError,
+                match=re.escape(
+                    "All weights must be between 0 and 1; found out-of-range "
+                    "weights [1.5] in [0.5, 1.5]."
+                ),
+            ):
+                DetuningMap(
+                    [(0, 0), (1, 0)], array_weights  # type: ignore[arg-type]
+                )
+            with pytest.raises(
+                ValueError,
+                match=re.escape(
+                    "Number of traps (3) and weights (2) don't match."
+                ),
+            ):
+                DetuningMap(
+                    [(0, 0), (1, 0), (2, 0)],
+                    array_weights,  # type: ignore[arg-type]
+                )
+
+        for reg in (layout, map_reg, register):
+            bad_weights: dict[int | str, float]
+            zero_weights: dict[int | str, float]
+            if reg == register:
+                bad_weights = {"0": -1.0, "1": 1.0, "2": 1.0}
+                zero_weights = {"0": 0.0}
+            else:
+                bad_weights = {0: -1.0, 1: 1.0, 2: 1.0}
+                zero_weights = {0: 0.0}
+            with pytest.raises(
+                ValueError,
+                match=re.escape(
+                    "All weights must be between 0 and 1; found out-of-range "
+                    "weights [-1.0] in [-1.0, 1.0, 1.0]."
+                ),
+            ):
+                reg.define_detuning_map(bad_weights)  # type: ignore
+            with pytest.warns(
+                UserWarning, match="should have at least one non-zero weight"
+            ):
+                reg.define_detuning_map(zero_weights)  # type: ignore
+
+    def test_init(
+        self,
+        layout: RegisterLayout,
+        register: BaseRegister,
+        map_reg: MappableRegister,
+        det_dict: dict[int, float],
+        slm_dict: dict[int, float],
+    ):
+
+        for reg in (layout, map_reg, register):
+            for detuning_map_dict in (det_dict, slm_dict):
+                reg_det_map_dict: dict[int | str, float]
+                if reg == register:
+                    reg_det_map_dict = {
+                        str(id): weight
+                        for (id, weight) in detuning_map_dict.items()
+                    }
+                else:
+                    reg_det_map_dict = cast(
+                        dict[Union[int, str], float], detuning_map_dict
+                    )
+                detuning_map = reg.define_detuning_map(
+                    reg_det_map_dict  # type: ignore
+                )
+                assert np.all(
+                    [
+                        detuning_map_dict[i] == detuning_map.weights[i]
+                        for i in range(len(detuning_map_dict))
+                    ]
+                )
+                assert np.all(
+                    [
+                        layout.coords[i]
+                        == np.array(detuning_map.trap_coordinates)[i]
+                        for i in range(len(detuning_map_dict))
+                    ]
+                )
+
+    @pytest.mark.parametrize("with_labels", [False, True])
+    def test_draw(self, det_map, slm_map, patch_plt_show, with_labels):
+        for detuning_map in (det_map, slm_map):
+            labels = (
+                list(range(detuning_map.number_of_traps))
+                if with_labels
+                else None
+            )
+            detuning_map.draw(labels=labels, show=True, custom_ax=None)
+            with patch("matplotlib.pyplot.savefig"):
+                detuning_map.draw(fig_name="det_map.pdf")
+        with pytest.raises(
+            ValueError, match="masked qubits and dmm qubits must be the same."
+        ):
+            slm_map._draw_2D(
+                slm_map._initialize_fig_axes(
+                    np.array(slm_map.trap_coordinates)
+                )[1],
+                np.array(slm_map.trap_coordinates),
+                [
+                    str(i)
+                    for i, _ in enumerate(cast(list, slm_map.trap_coordinates))
+                ],
+                with_labels=True,
+                dmm_qubits=dict(enumerate(slm_map.weights)),
+                masked_qubits={
+                    1,
+                },
+            )
+
+    @pytest.mark.parametrize("offset", [(0, 1.23), (-2.34, 0), (1.2, -3.4)])
+    def test_pos_offset(self, det_map, offset):
+        og_coords = det_map.trap_coordinates
+        expected_coords = og_coords + np.array(offset)
+        new_det_map = det_map.with_pos_offset(*offset)
+        # Original det map is unchanged
+        np.testing.assert_equal(det_map.trap_coordinates, og_coords)
+        assert det_map != new_det_map
+        assert new_det_map == DetuningMap(
+            expected_coords, det_map.weights, det_map.slug
+        )
+
+
+class TestDMM:
+    @pytest.fixture
+    def physical_dmm(self):
+        return DMM(
+            bottom_detuning=-1,
+            total_bottom_detuning=-10,
+            min_avg_abs_detuning=0.1,
+            clock_period=1,
+            min_duration=1,
+            max_duration=1e6,
+            mod_bandwidth=20,
+        )
+
+    def test_init(self, physical_dmm):
+        assert DMM().is_virtual()
+        dmm = physical_dmm
+        assert not dmm.is_virtual()
+        assert dmm.basis == "ground-rydberg"
+        assert dmm.addressing == "Global"
+        assert dmm.bottom_detuning == -1
+        assert dmm.total_bottom_detuning == -10
+        assert dmm.max_amp == 0
+        for value in (
+            dmm.max_abs_detuning,
+            dmm.min_retarget_interval,
+            dmm.fixed_retarget_t,
+            dmm.max_targets,
+        ):
+            assert value is None
+        with pytest.raises(
+            ValueError,
+            match=re.escape("'bottom_detuning' must be negative (got 1)."),
+        ):
+            DMM(bottom_detuning=1)
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "'total_bottom_detuning' must be negative (got 10)"
+            ),
+        ):
+            DMM(total_bottom_detuning=10)
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "'total_bottom_detuning' (got -1) must be lower than "
+                "'bottom_detuning' (got -10)"
+            ),
+        ):
+            DMM(total_bottom_detuning=-1, bottom_detuning=-10)
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "'min_avg_abs_detuning' must be non-negative (got -0.5)"
+            ),
+        ):
+            DMM(min_avg_abs_detuning=-0.5)
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "'min_avg_abs_detuning' (got 10.1) must be lower than or equal"
+                " to -bottom_detuning=10."
+            ),
+        ):
+            DMM(min_avg_abs_detuning=10.1, bottom_detuning=-10)
+
+        with pytest.raises(
+            NotImplementedError,
+            match=f"{DMM} cannot be initialized from `Global` method.",
+        ):
+            DMM.Global(None, None, bottom_detuning=1)
+        with pytest.raises(
+            NotImplementedError,
+            match=f"{DMM} cannot be initialized from `Local` method.",
+        ):
+            DMM.Local(None, None, bottom_detuning=1)
+
+    def test_validate_pulse(self, physical_dmm):
+        # both local and total bottom detuning must be defined to have a
+        # physical DMM
+        assert (virtual_local_dmm := DMM(bottom_detuning=-1)).is_virtual()
+        assert (virtual_dmm := DMM(total_bottom_detuning=-10)).is_virtual()
+        assert not physical_dmm.is_virtual()
+
+        # Detuning applied to DMM must be negative
+        pos_det_pulse = Pulse.ConstantPulse(100, 0, 1e-3, 0)
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "The detuning in a DMM must not be positive; it is positive"
+                f" at 0-99 ns in detuning {pos_det_pulse.detuning!r}."
+            ),
+        ):
+            physical_dmm.validate_pulse(pos_det_pulse)
+
+        # Local detuning is given by Pulse.detuning * local_weight
+        det_value = physical_dmm.bottom_detuning - 0.01
+        too_low_pulse = Pulse.ConstantPulse(100, 0, det_value, 0)
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "For a detuning map with a maximum weight of 1.0, a DMM pulse "
+                f"with minimum detuning {det_value} rad/µs "
+                "goes below the local bottom detuning of the DMM "
+                f"({physical_dmm.bottom_detuning} rad/µs). "
+                "To respect this constraint, keep the detuning above "
+                f"{float(physical_dmm.bottom_detuning)} rad/µs."
+            ),
+        ):
+            # tested with detuning map with weight 1
+            physical_dmm.validate_pulse(too_low_pulse)
+
+        # Should be valid in a virtual DMM without local bottom detuning
+        virtual_dmm.validate_pulse(too_low_pulse)
+
+        # Not too low if weights of detuning map are lower than 1
+        det_map = TriangularLatticeLayout(100, 10).define_detuning_map(
+            {i: 0.5 if i < 20 else 0.0 for i in range(100)}
+        )
+        summed_weight = sum(det_map.weights)
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "For a detuning map with a total summed weight of "
+                f"{summed_weight}, the total applied detuning from a DMM pulse"
+                f" with minimum detuning {det_value} rad/µs goes below the "
+                "total bottom detuning of the DMM "
+                f"({physical_dmm.total_bottom_detuning} rad/µs). "
+                "To respect this constraint, keep the detuning above "
+                f"{physical_dmm.total_bottom_detuning/summed_weight} rad/µs."
+            ),
+        ):
+            # local detunings match bottom_detuning, global don't
+            physical_dmm.validate_pulse(too_low_pulse, det_map)
+
+        # Should be valid in a virtual DMM without total bottom detuning
+        virtual_local_dmm.validate_pulse(too_low_pulse, det_map)
+
+        min_weight = 0.05
+        det_map = TriangularLatticeLayout(100, 10).define_detuning_map(
+            {1: min_weight}
+        )
+        assert min_weight * abs(det_value) < physical_dmm.min_avg_abs_detuning
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "For a detuning map with a minimum non-zero weight of "
+                f"{min_weight}, a DMM pulse with an average absolute detuning"
+                f" of {-det_value:.3g} rad/µs does not respect "
+                "the minimum threshold for the average absolute detuning of "
+                f"the DMM ({physical_dmm.min_avg_abs_detuning} rad/µs)."
+            ),
+        ):
+            physical_dmm.validate_pulse(too_low_pulse, det_map)
+
+        # If all weights are zero, validation doesn't fail
+        with pytest.warns(
+            UserWarning, match="should have at least one non-zero weight"
+        ):
+            det_map = TriangularLatticeLayout(100, 10).define_detuning_map(
+                {0: 0.0}
+            )
+        physical_dmm.validate_pulse(too_low_pulse, det_map)
+
+
+@pytest.mark.parametrize("n_traps", [29, 58])
+def test_dmm_bottom_detuning_float_tolerance(n_traps, monkeypatch):
+    # A detuning of total_bottom_detuning / n_traps must pass
+    dmm = DMM(bottom_detuning=-10.0, total_bottom_detuning=-30.0)
+    det_map = DetuningMap(
+        [(10 * i, 0) for i in range(n_traps)], [1.0] * n_traps
+    )
+    pulse = Pulse.ConstantPulse(100, 0, -30.0 / n_traps, 0)
+    dmm.validate_pulse(pulse, det_map)
+    # It would fail without the tolerance
+    monkeypatch.setattr(pulser.math, "VALIDATION_TOLERANCE", 0.0)
+    with pytest.raises(ValueError, match="goes below the total bottom"):
+        dmm.validate_pulse(pulse, det_map)
+
+
+def test_detuning_map_weights_float_tolerance():
+    det_map = DetuningMap([(0, 0), (10, 0)], [1 + 1e-15, -1e-17])
+    assert det_map.weights == (1.0, 0.0)
